@@ -1,0 +1,184 @@
+# Visualization of VaR and ES Backtests
+library(shiny)
+library(fEGarch)
+library(xts)
+library(ggplot2)
+library(gridExtra)
+
+ui <- fluidPage(
+  titlePanel("VaR & ES Backtesting (GARCH Models)"),
+  sidebarLayout(
+    sidebarPanel(
+      fileInput("file", "Upload CSV File", accept = ".csv"),
+      numericInput("n_test", "Test Set Size", value = 250, min = 50, step = 10),
+      actionButton("run", "Run Backtesting")
+    ),
+    mainPanel(
+      tabsetPanel(
+        tabPanel("Price & Returns", plotOutput("pricePlot"), plotOutput("returnPlot")),
+        tabPanel("Backtest Plots", uiOutput("modelPlots")),
+        tabPanel("Summary Table", tableOutput("summaryTable"))
+      )
+    )
+  )
+)
+
+server <- function(input, output) {
+  all_results <- reactiveValues(results = NULL, summary = NULL, prices = NULL, returns_xts = NULL)
+  
+  observeEvent(input$run, {
+    req(input$file)
+    
+    # Load and prepare data
+    data <- read.csv(input$file$datapath, stringsAsFactors = FALSE)
+    names(data)[names(data) == "Close/Last"] <- "Close"
+    data$Date <- as.Date(data$Date, format = "%m/%d/%Y")
+    data$Close <- as.numeric(gsub("\\$", "", data$Close))
+    data <- na.omit(data)
+    data <- data[order(data$Date), ]
+    
+    prices <- xts(data$Close, order.by = data$Date)
+    returns_xts <- na.omit(diff(log(prices)))
+    returns_numeric <- as.numeric(returns_xts)
+    
+    n_total <- length(returns_numeric)
+    n_test <- input$n_test
+    n_train <- n_total - n_test
+    train_returns <- returns_numeric[1:n_train]
+    test_returns <- returns_numeric[(n_train + 1):n_total]
+    test_dates <- index(returns_xts[(n_train + 1):n_total])
+    
+    model_types <- c("garch", "aparch", "egarch")
+    cond_dists <- c("std", "sstd")
+    risk_level <- 0.975
+    
+    all_model_results <- list()
+    summary_df <- data.frame(Model = character(), Conditional_Distribution = character(),
+                             Violations = numeric(), Expected_Zone = character(),
+                             stringsAsFactors = FALSE)
+    
+    for (m_type in model_types) {
+      for (c_dist in cond_dists) {
+        model_display <- paste0(toupper(m_type), "(1,1)-", c_dist)
+        model <- NULL
+        risk_results <- NULL
+        num_viol <- NA
+        zone <- "Error"
+        
+        try({
+          if (m_type == "garch") {
+            model <- garch(train_returns, orders = c(1, 1), cond_dist = c_dist)
+          } else if (m_type == "aparch") {
+            model <- aparch(train_returns, orders = c(1, 1), cond_dist = c_dist)
+          } else if (m_type == "egarch") {
+            spec <- fEGarch_spec(model_type = "egarch", orders = c(1, 1), cond_dist = c_dist)
+            model <- fEGarch(spec, train_returns)
+          }
+          
+          risk_results <- measure_risk(model, measure = c("VaR", "ES"), level = risk_level)
+          var_vals <- as.numeric(risk_results@measures$VaR[[paste0("VaR", risk_level)]])
+          es_vals <- as.numeric(risk_results@measures$ES[[paste0("ES", risk_level)]])
+          var_test <- tail(var_vals, n_test)
+          es_test <- tail(es_vals, n_test)
+          
+          zone_result <- trafflight_test(risk_results)
+          zone_name <- paste0("VaR", risk_level)
+          zone <- as.character(zone_result$VaR[[zone_name]]$zone)
+          num_viol <- sum(test_returns < var_test, na.rm = TRUE)
+          
+          all_model_results[[model_display]] <- list(
+            var = var_test,
+            es = es_test,
+            test_returns = test_returns,
+            test_dates = test_dates
+          )
+          
+          summary_df <- rbind(summary_df, data.frame(
+            Model = toupper(m_type),
+            Conditional_Distribution = c_dist,
+            Violations = num_viol,
+            Expected_Zone = zone
+          ))
+          
+        }, silent = TRUE)
+      }
+    }
+    
+    # Store results in reactive values
+    all_results$results <- all_model_results
+    all_results$summary <- summary_df
+    all_results$prices <- prices
+    all_results$returns_xts <- returns_xts
+  })
+  
+  # Plot closing prices
+  output$pricePlot <- renderPlot({
+    req(all_results$prices)
+    plot(all_results$prices, main = "Asset Daily Closing Prices", col = "steelblue",
+         xlab = "Date", ylab = "Closing Price")
+  })
+  
+  # Plot returns
+  output$returnPlot <- renderPlot({
+    req(all_results$returns_xts)
+    plot(all_results$returns_xts, main = "Asset Daily Log-Returns", col = "darkred",
+         xlab = "Date", ylab = "Log-Return")
+  })
+  
+  # Summary table
+  output$summaryTable <- renderTable({
+    req(all_results$summary)
+    all_results$summary
+  })
+  
+  # Generate backtest plots
+  output$modelPlots <- renderUI({
+    req(all_results$results)
+    plot_output_list <- lapply(names(all_results$results), function(model_name) {
+      plotname <- paste0("plot_", gsub("[^A-Za-z0-9]", "_", model_name))
+      plotOutput(plotname, height = "500px")
+    })
+    do.call(tagList, plot_output_list)
+  })
+  
+  observe({
+    req(all_results$results)
+    lapply(names(all_results$results), function(model_name) {
+      local({
+        model_res <- all_results$results[[model_name]]
+        plotname <- paste0("plot_", gsub("[^A-Za-z0-9]", "_", model_name))
+        
+        output[[plotname]] <- renderPlot({
+          df <- data.frame(
+            Date = model_res$test_dates,
+            Returns = model_res$test_returns,
+            VaR = model_res$var,
+            ES = model_res$es
+          )
+          df$VaR_Violation <- ifelse(df$Returns < df$VaR, "Violation", "No Violation")
+          df$ES_Violation <- ifelse(df$Returns < df$ES, "Violation", "No Violation")
+          
+          p1 <- ggplot(df, aes(x = Date)) +
+            geom_line(aes(y = Returns), color = "black") +
+            geom_line(aes(y = VaR), color = "red", linetype = "dashed") +
+            geom_point(data = subset(df, VaR_Violation == "Violation"),
+                       aes(y = Returns), color = "red", size = 2) +
+            labs(title = paste0(model_name, " - VaR Backtest"),
+                 y = "Returns")
+          
+          p2 <- ggplot(df, aes(x = Date)) +
+            geom_line(aes(y = Returns), color = "black") +
+            geom_line(aes(y = ES), color = "blue", linetype = "dashed") +
+            geom_point(data = subset(df, ES_Violation == "Violation"),
+                       aes(y = Returns), color = "blue", size = 2) +
+            labs(title = paste0(model_name, " - ES Backtest"),
+                 y = "Returns")
+          
+          grid.arrange(p1, p2, ncol = 1)
+        })
+      })
+    })
+  })
+}
+
+shinyApp(ui, server)
