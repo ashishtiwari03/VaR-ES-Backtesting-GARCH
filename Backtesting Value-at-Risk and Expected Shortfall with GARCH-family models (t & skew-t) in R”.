@@ -7,7 +7,7 @@ library(xts)
 library(ggplot2)
 
 # --- (a) Load data ---
-data <- read.csv("HistoricalData_1751308101399.csv", stringsAsFactors = FALSE)
+data <- read.csv("Dataset.csv", stringsAsFactors = FALSE)
 names(data)[names(data) == "Close/Last"] <- "Close"
 data$Date  <- as.Date(data$Date, format = "%m/%d/%Y")
 data$Close <- as.numeric(gsub("\\$", "", data$Close))
