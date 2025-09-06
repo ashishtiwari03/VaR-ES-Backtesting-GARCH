@@ -1,0 +1,106 @@
+# Backtesting Value-at-Risk and Expected Shortfall with GARCH-family models (t & skew-t) in R”.
+# Problem : Backtesting of VaR and ES
+# Author: Ashish Tiwari
+
+library(fEGarch)
+library(xts)
+library(ggplot2)
+
+# --- (a) Load data ---
+data <- read.csv("HistoricalData_1751308101399.csv", stringsAsFactors = FALSE)
+names(data)[names(data) == "Close/Last"] <- "Close"
+data$Date  <- as.Date(data$Date, format = "%m/%d/%Y")
+data$Close <- as.numeric(gsub("\\$", "", data$Close))
+data <- na.omit(data)
+data <- data[order(data$Date), ]
+prices <- xts(data$Close, order.by = data$Date)
+
+cat("First obs:", index(prices)[1], "\n")
+cat("Last obs :", index(prices)[NROW(prices)], "\n")
+cat("N =", NROW(prices), "\n")
+
+p_prices <- ggplot(data.frame(Date = index(prices), Price = as.numeric(prices)),
+                   aes(x = Date, y = Price)) +
+  geom_line() + theme_minimal() +
+  labs(title = "Daily Closing Prices", x = "Date", y = "Price")
+print(p_prices)  # show in R
+ggsave("a_prices.png", p_prices, width = 9, height = 4.5)
+
+# --- (b) Log-returns ---
+rets <- na.omit(diff(log(prices)))
+rets_num <- as.numeric(rets)
+
+p_rets <- ggplot(data.frame(Date = index(rets), Ret = rets_num),
+                 aes(x = Date, y = Ret)) +
+  geom_line() + theme_minimal() +
+  labs(title = "Daily Log-Returns", x = "Date", y = "Log-return")
+print(p_rets)
+ggsave("b_returns.png", p_rets, width = 9, height = 4.5)
+
+# --- (c,d) Models ---
+n_total <- length(rets_num); n_test <- 250
+train <- rets_num[1:(n_total - n_test)]
+test  <- rets_num[(n_total - n_test + 1):n_total]
+test_dates <- index(rets)[(n_total - n_test + 1):n_total]
+
+models <- c("garch", "aparch", "egarch")
+dists  <- c("std", "sstd")
+alpha  <- 0.975
+
+summary_df <- data.frame(Model=character(), Dist=character(),
+                         Violations=integer(), Zone=character(),
+                         stringsAsFactors=FALSE)
+
+for (m in models) {
+  for (d in dists) {
+    name <- paste0(toupper(m), "(1,1)-", d)
+    cat("Running:", name, "\n")
+    var_test <- es_test <- rep(NA, n_test); zone <- "n/a"; viol <- NA
+
+    try({
+      if (m=="garch")  fit <- garch(rt=train, orders=c(1,1), cond_dist=d)
+      if (m=="aparch") fit <- aparch(rt=train, orders=c(1,1), cond_dist=d)
+      if (m=="egarch") {
+        spec <- fEGarch_spec(model_type="egarch", orders=c(1,1), cond_dist=d)
+        fit <- fEGarch(spec, train)
+      }
+
+      risk <- measure_risk(fit, measure=c("VaR","ES"), level=alpha)
+      var_test <- tail(as.numeric(risk@measures$VaR[[paste0("VaR",alpha)]]), n_test)
+      es_test  <- tail(as.numeric(risk@measures$ES[[paste0("ES",alpha)]]),  n_test)
+      zone <- as.character(trafflight_test(risk)$VaR[[paste0("VaR",alpha)]]$zone)
+      viol <- sum(test < var_test, na.rm=TRUE)
+
+      df <- data.frame(Date=test_dates, Ret=test, VaR=var_test, ES=es_test)
+      df$VaR_Vio <- ifelse(df$Ret < df$VaR, 1, 0)
+      df$ES_Vio  <- ifelse(df$Ret < df$ES, 1, 0)
+
+      p1 <- ggplot(df, aes(Date, Ret)) +
+        geom_line() +
+        geom_line(aes(y=VaR), linetype="dashed", col="red") +
+        geom_point(data=subset(df, VaR_Vio==1), aes(y=Ret), col="red", shape=4) +
+        theme_minimal() + ggtitle(paste(name, "- VaR"))
+      print(p1)
+
+      p2 <- ggplot(df, aes(Date, Ret)) +
+        geom_line() +
+        geom_line(aes(y=ES), linetype="dashed", col="blue") +
+        geom_point(data=subset(df, ES_Vio==1), aes(y=Ret), col="blue", shape=4) +
+        theme_minimal() + ggtitle(paste(name, "- ES"))
+      print(p2)
+
+      ggsave(paste0(gsub("[^A-Za-z0-9]", "_", name), "_VaR.png"), p1, width=9, height=4.5)
+      ggsave(paste0(gsub("[^A-Za-z0-9]", "_", name), "_ES.png"),  p2, width=9, height=4.5)
+    }, silent=TRUE)
+
+    summary_df <- rbind(summary_df,
+                        data.frame(Model=toupper(m), Dist=d,
+                                   Violations=viol, Zone=zone,
+                                   stringsAsFactors=FALSE))
+  }
+}
+
+# --- (e) Summary ---
+write.csv(summary_df, "summary_backtests.csv", row.names=FALSE)
+print(summary_df, row.names=FALSE)
+cat("\nExpected violations at 97.5% over 250 days ≈", (1-alpha)*n_test, "\n")
